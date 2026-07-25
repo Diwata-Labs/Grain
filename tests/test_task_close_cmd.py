@@ -293,3 +293,72 @@ def test_task_close_idempotent_fail_after_done(tmp_path):
     # Second close attempt: status is now 'done', not 'review'
     result = _run_forge("--repo", str(repo), "task", "close", "--id", "TASK-0001")
     assert result.returncode == 3
+
+
+# ── task close: backlog sync ─────────────────────────────────────────────────
+# Regression: close_packet / quick_close_packet wrote the packet status to 'done'
+# but never synced docs/working/backlog.md, so every close left drift that only
+# `grain workflow reconcile --fix` cleaned up. start_task already syncs on the way
+# in; closing must sync symmetrically on the way out.
+
+_BACKLOG_P3T12 = """# Backlog
+
+## Phase 3 — Delivery
+
+### P3-T12 — The task under test
+- **Status:** in_progress
+- **Summary:** Do the thing.
+"""
+
+
+_CURRENT_TASK_IDLE = "# Current Task\n\nTask ID: none\nTask Path: none\nStatus: idle\n"
+
+
+def _seed_backlog(packet_repo, text: str = _BACKLOG_P3T12) -> None:
+    working = packet_repo / "docs" / "working"
+    working.mkdir(parents=True, exist_ok=True)
+    (working / "backlog.md").write_text(text, encoding="utf-8")
+    # reconcile requires current_task.md to exist before it checks status drift.
+    (working / "current_task.md").write_text(_CURRENT_TASK_IDLE, encoding="utf-8")
+
+
+def test_task_close_syncs_backlog_status_to_done(packet_repo):
+    _seed_backlog(packet_repo)
+    _make_closure_ready(packet_repo)
+    runner = CliRunner()
+    runner.invoke(
+        main, ["--repo", str(packet_repo), "task", "close", "--id", "TASK-0001"]
+    )
+    backlog = (packet_repo / "docs" / "working" / "backlog.md").read_text(encoding="utf-8")
+    assert "- **Status:** done" in backlog
+    assert "- **Status:** in_progress" not in backlog
+
+
+def test_task_close_leaves_reconcile_clean(packet_repo):
+    from grain.services.reconcile_service import reconcile
+
+    _seed_backlog(packet_repo)
+    _make_closure_ready(packet_repo)
+    runner = CliRunner()
+    runner.invoke(
+        main, ["--repo", str(packet_repo), "task", "close", "--id", "TASK-0001"]
+    )
+    result = reconcile(packet_repo)
+    mismatches = [i for i in result.issues if i.check == "packet_backlog_mismatch"]
+    assert mismatches == [], [i.description for i in result.issues]
+
+
+def test_task_close_quick_syncs_backlog_status_to_done(packet_repo):
+    _seed_backlog(packet_repo)
+    runner = CliRunner()
+    runner.invoke(
+        main,
+        ["--repo", str(packet_repo), "task", "create", "--phase", "3", "--task-num", "12"],
+    )
+    runner.invoke(
+        main,
+        ["--repo", str(packet_repo), "task", "close", "--id", "TASK-0001",
+         "--quick", "--summary", "Feature done"],
+    )
+    backlog = (packet_repo / "docs" / "working" / "backlog.md").read_text(encoding="utf-8")
+    assert "- **Status:** done" in backlog

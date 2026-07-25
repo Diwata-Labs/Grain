@@ -76,6 +76,30 @@ def resolve_task_identifier(positional: str | None, option: str | None) -> str |
     return None
 
 
+def _sync_backlog_status(
+    root: Path, packet_dir: Path, new_status: str, files_updated: list[str]
+) -> None:
+    """Sync docs/working/backlog.md for this packet's task ref to ``new_status``.
+
+    Both entering (start) and leaving (close) a packet must keep the backlog in
+    step, so ``grain workflow reconcile`` reports no drift immediately afterward.
+    No-op when the packet dir name carries no ``P#-T#`` ref or the backlog is
+    absent. Appends the backlog path to ``files_updated`` only when it changed.
+    """
+    ref_match = _TASK_REF_PATTERN.match(packet_dir.name)
+    backlog_path = root / "docs" / "working" / "backlog.md"
+    if not (ref_match and backlog_path.exists()):
+        return
+
+    from grain.services.reconcile_service import _update_backlog_task_status
+
+    text = backlog_path.read_text(encoding="utf-8")
+    new_text = _update_backlog_task_status(text, ref_match.group(1), new_status)
+    if new_text != text:
+        backlog_path.write_text(new_text, encoding="utf-8")
+        files_updated.append("docs/working/backlog.md")
+
+
 def create_packet_directory(
     root: Path, phase: int, task_num: int, title: str = "", simple: bool = False
 ) -> CommandResult:
@@ -267,6 +291,8 @@ def close_packet(root: Path, task_id: str) -> CommandResult:
     if results_path.exists():
         files_updated.insert(0, str(results_path.relative_to(root)))
 
+    _sync_backlog_status(root, packet_dir, "done", files_updated)
+
     # Side-band telemetry (opt-in, never raises, never alters control flow or
     # timing). emit_built guards builder construction too.
     from grain.services.telemetry_service import emit_built, make_task_close_event
@@ -349,8 +375,8 @@ def quick_close_packet(
 
     write_packet_status(packet_dir, "done")
 
-    files_written = [str(results_path.relative_to(root))]
-    files_written.append(str((packet_dir / "task.md").relative_to(root)))
+    files_updated = [str((packet_dir / "task.md").relative_to(root))]
+    _sync_backlog_status(root, packet_dir, "done", files_updated)
 
     # Side-band telemetry (opt-in, never raises, never alters control flow or
     # timing). emit_built guards builder construction too.
@@ -364,7 +390,7 @@ def quick_close_packet(
         task_id=task_id,
         status="done",
         files_created=[str(results_path.relative_to(root))],
-        files_updated=[str((packet_dir / "task.md").relative_to(root))],
+        files_updated=files_updated,
     )
 
 
@@ -486,16 +512,7 @@ def start_task(root: Path, task_id: str) -> CommandResult:
     files_updated = [str((packet_dir / "task.md").relative_to(root))]
 
     # ── Sync backlog.md status for this packet's task ref ────────────────────
-    ref_match = _TASK_REF_PATTERN.match(packet_dir.name)
-    backlog_path = root / "docs" / "working" / "backlog.md"
-    if ref_match and backlog_path.exists():
-        from grain.services.reconcile_service import _update_backlog_task_status
-
-        text = backlog_path.read_text(encoding="utf-8")
-        new_text = _update_backlog_task_status(text, ref_match.group(1), "in_progress")
-        if new_text != text:
-            backlog_path.write_text(new_text, encoding="utf-8")
-            files_updated.append("docs/working/backlog.md")
+    _sync_backlog_status(root, packet_dir, "in_progress", files_updated)
 
     # ── Sync current_task.md pointer ─────────────────────────────────────────
     current_task_path = root / "docs" / "working" / "current_task.md"

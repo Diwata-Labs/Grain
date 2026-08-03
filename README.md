@@ -290,8 +290,40 @@ Grain can report on the state of a workspace and surface what to do next, all fr
 ```bash
 grain status        # phase, task counts, active task, workflow stage, health summary
 grain doctor        # install mode, version alignment, workspace and Python checks
-grain docs audit    # lint canonical/working docs for drift, staleness, and structural gaps
+grain docs audit    # lint working docs AND the docs corpus for staleness signals
 ```
+
+### Docs lifecycle
+
+The docs corpus (`docs/canonical/`, `docs/working/`, `docs/archive/`) gets a full
+lifecycle toolset. The guiding rule: **labels are claims, not truth** — canonical
+docs can be stale, and a working doc can be more current than the canon it
+overlaps. The audit never assumes canon=fresh.
+
+```bash
+grain docs search "bronze routing"   # ranked text search; spans docs_registry.external_roots
+grain docs audit --doc corpus        # reference rot, subject drift, supersession queue,
+                                     # verification age, orphans, duplicates, stale drafts
+grain docs verify <doc>              # bump the Last-verified stamp ("reread, still true")
+grain docs archive <doc>             # move to docs/archive/ + tombstone at the old path
+grain docs promote <doc> --into <canon|new>   # resolve a supersession queue item
+grain docs index                     # regenerate the derived index (+ Doc Health section)
+```
+
+The index and Doc Health badges are **derived, never authored**: every `grain docs`
+command refreshes them incrementally before answering (extraction is cached per
+file; only changed files are re-parsed — rot/drift verdicts are always computed
+fresh against the current repo state). On-demand refresh is the default trigger;
+recommended integrations, not installed automatically:
+
+```bash
+# git hook — keep the index fresh on every commit/merge:
+echo 'grain docs index >/dev/null 2>&1 || true' >> .git/hooks/post-commit
+# CI — scheduled corpus audit (non-zero exit only with --strict):
+grain docs audit --format json --strict
+```
+
+Use `--no-refresh` on `docs search` / `docs audit` to skip the refresh in scripts.
 
 `grain suggest` proposes what to pick up next from actionable signals in the workspace. Acceptance and dismissal are **subcommands**, not flags:
 

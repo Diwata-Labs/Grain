@@ -88,6 +88,10 @@ class AuditConfig:
     tooling_notes_high_severity_aging_days: int = 14
     tooling_notes_overdue_triage_max: int = 5
     proposal_aging_days: int = 30
+    # corpus staleness signals (labels are claims, not truth)
+    canon_unverified_days: int = 90
+    subject_drift_commits: int = 10
+    draft_archive_days: int = 120
 
 
 # ── Check group filters ────────────────────────────────────────────────────────
@@ -103,6 +107,27 @@ _DOC_FILTER_MAP = {
     "cross_doc": "cross_doc",
 }
 
+# Corpus-level staleness signals. Each is separately selectable via
+# ``--doc <signal>`` and all run under ``--doc corpus`` (and by default).
+_CORPUS_SIGNALS = frozenset({
+    "reference_rot",
+    "subject_drift",
+    "supersession",
+    "verification_age",
+    "orphans",
+    "duplicate_topics",
+    "stale_drafts",
+    "manifest_reconciliation",
+})
+
+# Structural workflow docs — part of the grain workspace machinery, never
+# lifecycle candidates (they are edited in place forever, not promoted/archived).
+_WORKFLOW_DOC_NAMES = frozenset({
+    "current_task.md", "backlog.md", "current_focus.md", "open_questions.md",
+    "tooling_notes.md", "change_proposals.md", "workflow_metrics.md",
+    "project_state.md", "implementation_plan.md", "roadmap.md",
+})
+
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -110,8 +135,14 @@ def run_audit(
     root: Path,
     doc_filter: str | None = None,
     severity_filter: str | None = None,
+    progress=None,
 ) -> AuditResult:
-    """Run all checks (or filtered subset) and return structured results."""
+    """Run all checks (or filtered subset) and return structured results.
+
+    ``progress`` is an optional ``Callable[[str], None]`` invoked with short
+    status lines during potentially slow corpus phases (git-backed signals over
+    large corpora), so callers can avoid silent hangs.
+    """
     config = _load_config(root)
     all_findings: list[AuditFinding] = []
 
@@ -133,6 +164,12 @@ def run_audit(
         all_findings.extend(_check_structural(root))
     if "cross_doc" in groups:
         all_findings.extend(_check_cross_doc(root))
+
+    requested_signals = groups & _CORPUS_SIGNALS
+    if requested_signals:
+        all_findings.extend(
+            _check_corpus(root, config, requested_signals, progress=progress)
+        )
 
     if severity_filter == "high":
         visible = [f for f in all_findings if f.severity == "error"]
@@ -218,6 +255,9 @@ def _load_config(root: Path) -> AuditConfig:
             ),
             tooling_notes_overdue_triage_max=thresholds.get("tooling_notes_overdue_triage_max", 5),
             proposal_aging_days=thresholds.get("proposal_aging_days", 30),
+            canon_unverified_days=thresholds.get("canon_unverified_days", 90),
+            subject_drift_commits=thresholds.get("subject_drift_commits", 10),
+            draft_archive_days=thresholds.get("draft_archive_days", 120),
         )
     except Exception:
         return AuditConfig()
@@ -228,10 +268,12 @@ def _resolve_groups(doc_filter: str | None) -> set[str]:
         "current_task", "backlog", "current_focus",
         "open_questions", "tooling_notes", "change_proposals", "structural",
         "cross_doc",
-    }
+    } | set(_CORPUS_SIGNALS)
     if not doc_filter:
         return all_groups
     key = doc_filter.replace(".md", "")
+    if key == "corpus":
+        return set(_CORPUS_SIGNALS)
     return {key} if key in all_groups else all_groups
 
 
@@ -1249,6 +1291,462 @@ def _max_task_id_on_disk(root: Path) -> int | None:
             if max_id is None or num > max_id:
                 max_id = num
     return max_id
+
+
+# ── Corpus staleness signals ──────────────────────────────────────────────────
+#
+# Design ruling (2026-08): labels are claims, not truth. A canonical doc can be
+# stale, and a working doc can be MORE current than the canon it overlaps. No
+# signal below assumes canon=fresh: reference rot and subject drift apply to
+# canon; verification age nags canon that is long-UNVERIFIED (not long-unedited);
+# supersession surfaces working-newer-than-canon conflicts as queue items and
+# never auto-rules.
+#
+# Rot and drift always evaluate against the repo state at audit time — the
+# corpus cache stores extraction (links, refs, stamps), never verdicts.
+
+def _check_corpus(
+    root: Path,
+    config: AuditConfig,
+    signals: set[str],
+    progress=None,
+) -> list[AuditFinding]:
+    from grain.services.docs_corpus import (
+        last_commit_dates,
+        load_corpus,
+        load_git_commit_index,
+    )
+
+    def _tick(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
+    manifest = _safe_manifest(root)
+    _tick("scanning docs corpus…")
+    corpus = load_corpus(root, manifest=manifest, use_cache=True)
+
+    # One batched git-history walk serves every git-backed signal (dates +
+    # churn) — cost scales with history once, not with docs × references.
+    git_index = None
+    git_dates: dict = {}
+    if signals & {"subject_drift", "supersession", "verification_age", "stale_drafts"}:
+        _tick("reading git history…")
+        git_index = load_git_commit_index(root)
+        if git_index is not None:
+            git_dates = last_commit_dates(git_index)
+
+    findings: list[AuditFinding] = []
+    if "reference_rot" in signals:
+        _tick("checking reference rot…")
+        findings.extend(_check_reference_rot(root, corpus, manifest))
+    if "subject_drift" in signals:
+        _tick("checking subject drift (git history)…")
+        findings.extend(_check_subject_drift(root, corpus, config, git_index, git_dates))
+    if "supersession" in signals:
+        _tick("checking supersession pressure…")
+        findings.extend(_check_supersession(root, corpus, config, manifest, git_dates))
+    if "verification_age" in signals:
+        _tick("checking verification age…")
+        findings.extend(_check_verification_age(corpus, config, git_dates))
+    if "orphans" in signals:
+        findings.extend(_check_orphans(corpus, manifest))
+    if "duplicate_topics" in signals:
+        findings.extend(_check_duplicate_topics(corpus))
+    if "stale_drafts" in signals:
+        findings.extend(_check_stale_drafts(corpus, config, git_dates))
+    if "manifest_reconciliation" in signals:
+        findings.extend(_check_manifest_reconciliation(corpus, manifest))
+    return findings
+
+
+def _safe_manifest(root: Path) -> dict:
+    manifest_path = root / _MANIFEST_PATH
+    if not manifest_path.exists():
+        return {}
+    try:
+        import yaml  # type: ignore
+        return yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _registered_paths(manifest: dict) -> set[str]:
+    return {
+        e.get("path", "").rstrip("/")
+        for e in _collect_manifest_doc_entries(manifest)
+        if e.get("path")
+    }
+
+
+def _doc_targets(doc) -> list[str]:
+    """All repo-relative paths a doc cites (links + path refs), deduplicated."""
+    seen: set[str] = set()
+    targets: list[str] = []
+    for t in list(doc.resolved_links) + list(doc.path_refs):
+        if t and t not in seen:
+            seen.add(t)
+            targets.append(t)
+    return targets
+
+
+# a. Reference rot — objective staleness; applies to canon too.
+
+def _check_reference_rot(root: Path, corpus: list, manifest: dict) -> list[AuditFinding]:
+    from grain.services.docs_corpus import external_roots_from_manifest
+
+    # Cross-repo citations resolve against registered external roots by name
+    # prefix: `labs/docs/x.md` checks <external root 'labs'>/docs/x.md.
+    ext_roots = dict(external_roots_from_manifest(root, manifest))
+
+    def _exists(doc, target: str) -> bool:
+        if (root / target).exists():
+            return True
+        # doc-relative citations: `canonical/x.md` written from docs/working/
+        # resolves via the doc's own directory or its parent tree
+        if (doc.abs_path.parent / target).exists():
+            return True
+        if (doc.abs_path.parent.parent / target).exists():
+            return True
+        # cross-repo citations resolve against external roots by name prefix
+        head, _, tail = target.partition("/")
+        if tail and head in ext_roots and (ext_roots[head] / tail).exists():
+            return True
+        return False
+
+    findings: list[AuditFinding] = []
+    checked = 0
+    for doc in corpus:
+        if doc.layer == "archive" or doc.root_name:
+            continue  # archived docs are frozen history; external roots are search-only
+        checked += 1
+        missing = [t for t in _doc_targets(doc) if not _exists(doc, t)]
+        if missing:
+            shown = ", ".join(missing[:3])
+            more = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""
+            findings.append(AuditFinding(
+                doc="reference_rot", check_id="reference_rot", severity="warning",
+                message=f"{doc.rel_path}: cites missing path(s): {shown}{more}",
+                remediation=f"update or remove the dead references in {doc.rel_path}",
+            ))
+    if not findings:
+        findings.append(AuditFinding(
+            doc="reference_rot", check_id="reference_rot", severity="pass",
+            message=f"all cited paths resolve ({checked} docs checked)",
+        ))
+    return findings
+
+
+# b. Subject drift — the world moved, the doc didn't. Git-backed; degrades
+#    gracefully outside a repo.
+
+def _check_subject_drift(
+    root: Path, corpus: list, config: AuditConfig, git_index, git_dates: dict
+) -> list[AuditFinding]:
+    from grain.services.docs_corpus import churn_since
+
+    if git_index is None:
+        return [AuditFinding(
+            doc="subject_drift", check_id="subject_drift", severity="pass",
+            message="not a git repository — subject drift skipped",
+        )]
+
+    findings: list[AuditFinding] = []
+    for doc in corpus:
+        if doc.layer == "archive" or doc.root_name:
+            continue
+        targets = [t for t in _doc_targets(doc) if (root / t).exists()]
+        if not targets:
+            continue
+        doc_date = _doc_date(doc, git_dates)
+        if doc_date is None:
+            continue
+        churn = churn_since(git_index, set(targets), doc_date)
+        if churn >= config.subject_drift_commits:
+            shown = ", ".join(targets[:3])
+            more = f", +{len(targets) - 3} more" if len(targets) > 3 else ""
+            findings.append(AuditFinding(
+                doc="subject_drift", check_id="subject_drift", severity="warning",
+                message=(
+                    f"{doc.rel_path}: referenced paths churned in {churn} commit(s) "
+                    f"since the doc last changed ({doc_date}) — {shown}{more}"
+                ),
+                remediation=f"reread {doc.rel_path} against the current code, then grain docs verify {doc.rel_path}",
+            ))
+    if not findings:
+        findings.append(AuditFinding(
+            doc="subject_drift", check_id="subject_drift", severity="pass",
+            message=f"no doc's referenced paths churned ≥{config.subject_drift_commits} commits",
+        ))
+    return findings
+
+
+# c. Supersession pressure — a working doc newer than an overlapping canon doc
+#    becomes a PROMOTION CANDIDATE queue item. The audit never auto-rules.
+
+def _title_tokens(title: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", title.lower()) if t}
+
+
+def _titles_overlap(a: str, b: str, threshold: float = 0.5) -> bool:
+    ta, tb = _title_tokens(a), _title_tokens(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / len(ta | tb) >= threshold
+
+
+def _manifest_topics(manifest: dict) -> dict[str, set[str]]:
+    """path -> topic tags, from optional ``topics:`` lists on manifest entries."""
+    topics: dict[str, set[str]] = {}
+    for entry in _collect_manifest_doc_entries(manifest):
+        raw = entry.get("topics")
+        if isinstance(raw, list) and raw:
+            topics[entry.get("path", "")] = {str(t).lower() for t in raw}
+    return topics
+
+
+def _doc_date(doc, git_dates: dict):
+    """Doc recency: last git commit date when available, else mtime.
+
+    Git wins because mtime is fragile (clones and copies reset it); an
+    uncommitted edit is transient and will be seen on the post-commit run."""
+    d = git_dates.get(doc.rel_path)
+    if d is not None:
+        return d
+    return doc.last_modified.date() if doc.last_modified else None
+
+
+def _check_supersession(
+    root: Path, corpus: list, config: AuditConfig, manifest: dict, git_dates: dict
+) -> list[AuditFinding]:
+    canon = [d for d in corpus if d.layer == "canonical" and not d.root_name]
+    working = [
+        d for d in corpus
+        if d.layer == "working" and not d.root_name
+        and d.abs_path.name not in _WORKFLOW_DOC_NAMES
+        and not d.is_tombstone
+    ]
+    topics = _manifest_topics(manifest)
+    inbound: dict[str, int] = {}
+    for doc in corpus:
+        for target in doc.resolved_links:
+            inbound[target] = inbound.get(target, 0) + 1
+
+    findings: list[AuditFinding] = []
+    for w in working:
+        w_date = _doc_date(w, git_dates)
+        if w_date is None:
+            continue
+        w_targets = set(_doc_targets(w))
+        for c in canon:
+            c_date = _doc_date(c, git_dates)
+            if c_date is None or w_date <= c_date:
+                continue
+            overlap = (
+                _titles_overlap(w.title, c.title)
+                or bool(w_targets & set(_doc_targets(c)))
+                or bool(topics.get(w.rel_path, set()) & topics.get(c.rel_path, set()))
+            )
+            if not overlap:
+                continue
+            refs = inbound.get(w.rel_path, 0)
+            findings.append(AuditFinding(
+                doc="supersession", check_id="supersession", severity="warning",
+                message=(
+                    f"PROMOTION CANDIDATE: working {w.rel_path} (modified {w_date}, "
+                    f"{refs} inbound ref(s)) may supersede canon {c.rel_path} "
+                    f"(modified {c_date})"
+                ),
+                remediation=(
+                    f"review both, then grain docs promote {w.rel_path} "
+                    f"--into {c.rel_path} — or dismiss by updating the canon doc"
+                ),
+            ))
+    if not findings:
+        findings.append(AuditFinding(
+            doc="supersession", check_id="supersession", severity="pass",
+            message="no working doc is newer than an overlapping canonical doc",
+        ))
+    return findings
+
+
+# d. Verification age — canon staleness is long-UNVERIFIED, not long-unedited.
+
+def _check_verification_age(
+    corpus: list, config: AuditConfig, git_dates: dict
+) -> list[AuditFinding]:
+    if config.canon_unverified_days <= 0:
+        return [AuditFinding(
+            doc="verification_age", check_id="verification_age", severity="pass",
+            message="verification-age nag disabled (canon_unverified_days ≤ 0)",
+        )]
+    today = datetime.now(tz=timezone.utc).date()
+    findings: list[AuditFinding] = []
+    for doc in corpus:
+        if doc.layer != "canonical" or doc.root_name or doc.is_tombstone:
+            continue
+        if doc.last_verified is not None:
+            age = (today - doc.last_verified).days
+            if age > config.canon_unverified_days:
+                findings.append(AuditFinding(
+                    doc="verification_age", check_id="verification_age", severity="warning",
+                    message=(
+                        f"{doc.rel_path}: last verified {age} days ago "
+                        f"(threshold: {config.canon_unverified_days})"
+                    ),
+                    remediation=f"reread it, then grain docs verify {doc.rel_path}",
+                ))
+        else:
+            doc_date = _doc_date(doc, git_dates)
+            mod_age = (today - doc_date).days if doc_date else None
+            if mod_age is not None and mod_age > config.canon_unverified_days:
+                findings.append(AuditFinding(
+                    doc="verification_age", check_id="verification_age", severity="warning",
+                    message=(
+                        f"{doc.rel_path}: never verified and untouched for {mod_age} days "
+                        f"(threshold: {config.canon_unverified_days})"
+                    ),
+                    remediation=f"reread it, then grain docs verify {doc.rel_path}",
+                ))
+    if not findings:
+        findings.append(AuditFinding(
+            doc="verification_age", check_id="verification_age", severity="pass",
+            message="all canonical docs verified (or modified) recently enough",
+        ))
+    return findings
+
+
+# Classics — orphans, duplicate-topic clusters, stale drafts, reconciliation.
+
+def _check_orphans(corpus: list, manifest: dict) -> list[AuditFinding]:
+    registered = _registered_paths(manifest)
+    linked: set[str] = set()
+    for doc in corpus:
+        linked.update(doc.resolved_links)
+
+    findings: list[AuditFinding] = []
+    for doc in corpus:
+        if doc.layer not in ("canonical", "working") or doc.root_name or doc.is_tombstone:
+            continue
+        if doc.abs_path.name in _WORKFLOW_DOC_NAMES:
+            continue
+        if doc.rel_path in registered or doc.rel_path in linked:
+            continue
+        findings.append(AuditFinding(
+            doc="orphans", check_id="orphans", severity="warning",
+            message=f"{doc.rel_path}: no inbound links and not in the manifest",
+            remediation=(
+                f"register it in docs_manifest.yaml, link it from another doc, "
+                f"or grain docs archive {doc.rel_path}"
+            ),
+        ))
+    if not findings:
+        findings.append(AuditFinding(
+            doc="orphans", check_id="orphans", severity="pass",
+            message="no orphaned docs (all linked or registered)",
+        ))
+    return findings
+
+
+def _check_duplicate_topics(corpus: list) -> list[AuditFinding]:
+    docs = [
+        d for d in corpus
+        if d.layer in ("canonical", "working") and not d.root_name and d.title
+        and d.abs_path.name not in _WORKFLOW_DOC_NAMES and not d.is_tombstone
+    ]
+    # Union-find over title-similar pairs
+    parent = {d.rel_path: d.rel_path for d in docs}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, a in enumerate(docs):
+        for b in docs[i + 1:]:
+            if _titles_overlap(a.title, b.title, threshold=0.6):
+                parent[find(a.rel_path)] = find(b.rel_path)
+
+    clusters: dict[str, list[str]] = {}
+    for d in docs:
+        clusters.setdefault(find(d.rel_path), []).append(d.rel_path)
+
+    findings: list[AuditFinding] = []
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        findings.append(AuditFinding(
+            doc="duplicate_topics", check_id="duplicate_topics", severity="warning",
+            message=f"possible duplicate topic cluster: {', '.join(sorted(members))}",
+            remediation="consolidate into one doc; archive or promote the others",
+        ))
+    if not findings:
+        findings.append(AuditFinding(
+            doc="duplicate_topics", check_id="duplicate_topics", severity="pass",
+            message="no duplicate-topic clusters detected",
+        ))
+    return findings
+
+
+def _check_stale_drafts(
+    corpus: list, config: AuditConfig, git_dates: dict
+) -> list[AuditFinding]:
+    if config.draft_archive_days <= 0:
+        return [AuditFinding(
+            doc="stale_drafts", check_id="stale_drafts", severity="pass",
+            message="stale-draft check disabled (draft_archive_days ≤ 0)",
+        )]
+    today = datetime.now(tz=timezone.utc).date()
+    findings: list[AuditFinding] = []
+    for doc in corpus:
+        if doc.layer != "working" or doc.root_name or doc.is_tombstone:
+            continue
+        if doc.abs_path.name in _WORKFLOW_DOC_NAMES:
+            continue
+        doc_date = _doc_date(doc, git_dates)
+        if doc_date is None:
+            continue
+        age = (today - doc_date).days
+        if age > config.draft_archive_days:
+            findings.append(AuditFinding(
+                doc="stale_drafts", check_id="stale_drafts", severity="warning",
+                message=f"{doc.rel_path}: untouched for {age} days (threshold: {config.draft_archive_days})",
+                remediation=f"grain docs archive {doc.rel_path} (or promote it if it superseded canon)",
+            ))
+    if not findings:
+        findings.append(AuditFinding(
+            doc="stale_drafts", check_id="stale_drafts", severity="pass",
+            message="no working docs old enough to archive",
+        ))
+    return findings
+
+
+def _check_manifest_reconciliation(corpus: list, manifest: dict) -> list[AuditFinding]:
+    """Corpus docs absent from the manifest. (The inverse — manifest entries
+    pointing at missing files — is the structural ``registered_doc_missing``
+    check, which predates the corpus signals.)"""
+    if not manifest:
+        return [AuditFinding(
+            doc="manifest_reconciliation", check_id="manifest_unregistered", severity="pass",
+            message="no manifest — reconciliation skipped",
+        )]
+    registered = _registered_paths(manifest)
+    findings: list[AuditFinding] = []
+    for doc in corpus:
+        if doc.layer not in ("canonical", "working") or doc.root_name or doc.is_tombstone:
+            continue
+        if doc.rel_path not in registered:
+            findings.append(AuditFinding(
+                doc="manifest_reconciliation", check_id="manifest_unregistered", severity="warning",
+                message=f"{doc.rel_path}: present on disk but not registered in docs_manifest.yaml",
+                remediation=f"add a {doc.layer} entry for it (or grain docs archive {doc.rel_path})",
+            ))
+    if not findings:
+        findings.append(AuditFinding(
+            doc="manifest_reconciliation", check_id="manifest_unregistered", severity="pass",
+            message="every corpus doc is registered in the manifest",
+        ))
+    return findings
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

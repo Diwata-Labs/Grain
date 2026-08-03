@@ -1,4 +1,6 @@
-version: 1
+# Schema v2 adds the optional docs_registry and audit_thresholds blocks.
+# v1 manifests remain fully supported — every new key has a default.
+version: 2
 
 project:
   name: "[Your Project Name]"
@@ -47,6 +49,34 @@ upgrade_policy:
 telemetry:
   enabled: false                    # true to opt in to Pulse event emission
   endpoint: ""                      # optional Pulse ingest URL (env var overrides)
+
+# Docs corpus registry — drives `grain docs search/audit` and the derived index.
+# corpus_dirs defaults to the three lifecycle dirs below. external_roots lets one
+# search span other repos' documentation (audit stays scoped to THIS repo).
+docs_registry:
+  corpus_dirs:
+    - docs/canonical
+    - docs/working
+    - docs/archive
+  external_roots: []
+  # external_roots example:
+  #   - name: labs
+  #     path: ~/Diwata/Diwata-Labs/docs
+
+# Thresholds for `grain docs audit`. Corpus staleness signals treat labels as
+# claims, not truth: canon staleness = long-UNVERIFIED (grain docs verify bumps
+# the Last-verified stamp), never long-unedited.
+audit_thresholds:
+  current_task_idle_days: 14
+  current_focus_stale_days: 30
+  oq_blocking_max: 3
+  oq_stale_open_days: 60
+  tooling_notes_high_severity_aging_days: 14
+  tooling_notes_overdue_triage_max: 5
+  proposal_aging_days: 30
+  canon_unverified_days: 90         # nag canonical docs unverified this long
+  subject_drift_commits: 10         # commits touching a doc's cited paths since its last edit
+  draft_archive_days: 120           # working docs untouched this long are archive candidates
 
 canonical:
   - id: product_scope

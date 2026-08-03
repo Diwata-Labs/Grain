@@ -72,7 +72,7 @@ def generate_index(root: Path, dry_run: bool = False) -> CommandResult:
         CommandResult with ok=True on success.
     """
     try:
-        manifest = load_manifest(root)
+        content, line_count = _render_index(root)
     except ForgeError as exc:
         return CommandResult(
             ok=False,
@@ -81,6 +81,56 @@ def generate_index(root: Path, dry_run: bool = False) -> CommandResult:
             errors=[exc.message],
         )
 
+    index_path = root / "docs" / "runtime" / "docs_index.md"
+
+    if dry_run:
+        return CommandResult(
+            ok=True,
+            command="docs index",
+            repo=str(root),
+            warnings=[f"dry-run: would write {line_count} lines to {index_path}"],
+        )
+
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(content, encoding="utf-8")
+    return CommandResult(
+        ok=True,
+        command="docs index",
+        repo=str(root),
+        files_updated=[str(index_path.relative_to(root))],
+    )
+
+
+def refresh_index(root: Path) -> bool:
+    """Best-effort incremental refresh of the derived docs_index.md.
+
+    The registry/index is DERIVED, never authored: every ``grain docs`` command
+    calls this before answering (unless ``--no-refresh``). Writes only when the
+    rendered content actually changed; never raises — a repo without a manifest
+    simply skips the refresh.
+
+    Returns True when the index file was (re)written.
+    """
+    try:
+        content, _ = _render_index(root)
+    except Exception:
+        return False
+    index_path = root / "docs" / "runtime" / "docs_index.md"
+    try:
+        existing = index_path.read_text(encoding="utf-8") if index_path.exists() else None
+        if existing == content:
+            return False
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(content, encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def _render_index(root: Path) -> tuple[str, int]:
+    """Render the docs index content. Raises ForgeError when the manifest is
+    missing or invalid."""
+    manifest = load_manifest(root)
     registry = build_registry(manifest)
     authority_order = manifest.get("rules", {}).get("authority_order", [])
 
@@ -115,24 +165,86 @@ def generate_index(root: Path, dry_run: bool = False) -> CommandResult:
             )
         lines.append("")
 
+    lines.extend(_render_doc_health(root, manifest))
+
     content = "\n".join(lines)
-    index_path = root / "docs" / "runtime" / "docs_index.md"
+    return content, len(lines)
 
-    if dry_run:
-        return CommandResult(
-            ok=True,
-            command="docs index",
-            repo=str(root),
-            warnings=[f"dry-run: would write {len(lines)} lines to {index_path}"],
+
+def _render_doc_health(root: Path, manifest: dict) -> list[str]:
+    """Derived Doc Health section: verified dates + staleness badges.
+
+    Appended after the classic tables so existing consumers of the index keep
+    their format untouched. Badges are computed FRESH from the current repo
+    state at render time (verification stamps + cited-path existence) — never
+    replayed from a previous audit's verdicts.
+    """
+    from datetime import date
+
+    from grain.services.docs_corpus import external_roots_from_manifest, load_corpus
+
+    corpus = [
+        d for d in load_corpus(root, manifest=manifest, use_cache=True)
+        if d.layer in ("canonical", "working") and not d.root_name
+    ]
+    if not corpus:
+        return []
+
+    ext_roots = dict(external_roots_from_manifest(root, manifest))
+
+    def _target_exists(target: str) -> bool:
+        if (root / target).exists():
+            return True
+        head, _, tail = target.partition("/")
+        return bool(tail) and head in ext_roots and (ext_roots[head] / tail).exists()
+
+    thresholds = manifest.get("audit_thresholds") or {}
+    try:
+        unverified_days = int(thresholds.get("canon_unverified_days", 90))
+    except (TypeError, ValueError):
+        unverified_days = 90
+    today = date.today()
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("")
+    lines.append("## Doc Health")
+    lines.append("")
+    lines.append("> Derived — refreshed by `grain docs` commands. Full signals: `grain docs audit`.")
+    lines.append("")
+    lines.append("| Path | Layer | Modified | Last-verified | Badges |")
+    lines.append("|----|----|----|----|----|")
+
+    order = {"canonical": 0, "working": 1}
+    for doc in sorted(corpus, key=lambda d: (order.get(d.layer, 9), d.rel_path)):
+        badges: list[str] = []
+        if doc.is_tombstone:
+            badges.append("TOMBSTONE")
+        else:
+            missing = [
+                t
+                for t in dict.fromkeys(list(doc.resolved_links) + list(doc.path_refs))
+                if t and not _target_exists(t)
+            ]
+            if missing:
+                badges.append(f"ROT:{len(missing)}")
+            if doc.layer == "canonical" and unverified_days > 0:
+                if doc.last_verified is not None:
+                    if (today - doc.last_verified).days > unverified_days:
+                        badges.append("UNVERIFIED")
+                elif (
+                    doc.last_modified is not None
+                    and (today - doc.last_modified.date()).days > unverified_days
+                ):
+                    badges.append("UNVERIFIED")
+        modified = doc.last_modified.date().isoformat() if doc.last_modified else "—"
+        verified = doc.last_verified.isoformat() if doc.last_verified else "never"
+        lines.append(
+            f"| `{doc.rel_path}` | {doc.layer} | {modified} | {verified} "
+            f"| {' '.join(badges) if badges else '—'} |"
         )
-
-    index_path.write_text(content, encoding="utf-8")
-    return CommandResult(
-        ok=True,
-        command="docs index",
-        repo=str(root),
-        files_updated=[str(index_path.relative_to(root))],
-    )
+    lines.append("")
+    return lines
 
 
 def show_doc(root: Path, doc_id: str) -> tuple[CommandResult, DocumentRecord | None]:

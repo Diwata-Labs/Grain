@@ -13,33 +13,61 @@ from grain.services import docs_service
 
 @click.group("docs")
 def docs_group():
-    """Inspect and validate repository documentation state."""
+    """Inspect, search, audit, and manage repository documentation lifecycle.
+
+    \b
+    The docs index (docs/runtime/docs_index.md) is DERIVED, never authored:
+    every docs command refreshes it incrementally before answering (pass
+    --no-refresh where offered to skip). On-demand refresh is the default
+    trigger. Recommended integrations (not installed automatically):
+      git hook:  echo 'grain docs index >/dev/null || true' >> .git/hooks/post-commit
+      CI:        run `grain docs audit --format json` on a schedule
+    """
 
 
 @docs_group.command("audit")
-@click.option("--doc", default=None, help="Run checks only for this doc (e.g. current_task, backlog, structural).")
+@click.option("--doc", default=None, help="Run checks only for this group: a working doc (current_task, backlog), "
+              "'corpus' for all staleness signals, or one signal (reference_rot, subject_drift, "
+              "supersession, verification_age, orphans, duplicate_topics, stale_drafts, manifest_reconciliation).")
 @click.option("--severity", default=None, type=click.Choice(["high", "medium"]), help="Filter by minimum severity (high=errors only, medium=warnings+errors).")
 @click.option("--fix", is_flag=True, default=False, help="Apply safe auto-fixes (prompts per finding).")
 @click.option("--no-confirm", is_flag=True, default=False, help="Apply fixes without prompting (agent use only). Requires --fix.")
+@click.option("--strict", is_flag=True, default=False,
+              help="Exit non-zero when the audit has findings (CI use). Default: report and exit 0.")
+@click.option("--no-refresh", is_flag=True, default=False,
+              help="Skip the derived-index refresh before auditing (scripted use).")
 @click.pass_context
-def docs_audit(ctx, doc, severity, fix, no_confirm):
-    """Run a broad workspace health check across all registered working documents.
+def docs_audit(ctx, doc, severity, fix, no_confirm, strict, no_refresh):
+    """Audit workspace docs AND the docs corpus for staleness.
+
+    Corpus signals treat labels as claims, not truth: reference rot and subject
+    drift apply to canonical docs too, verification age nags long-UNVERIFIED
+    canon (not long-unedited), and supersession surfaces working docs that may
+    be more current than the canon they overlap — as a queue, never auto-ruled.
 
     \b
     Examples:
       grain docs audit
-      grain docs audit --doc current_task
+      grain docs audit --doc corpus
+      grain docs audit --doc supersession
       grain docs audit --severity high
       grain docs audit --format json
-      grain docs audit --fix
+      grain docs audit --strict   (CI: non-zero exit on findings)
     """
     repo = ctx.obj.get("repo") if ctx.obj else None
     fmt = ctx.obj.get("fmt", "text") if ctx.obj else "text"
     root = resolve_repo_root(repo)
 
+    if not no_refresh:
+        docs_service.refresh_index(root)
+
     from grain.services.docs_audit_service import run_audit, save_audit_cache, apply_fixes
 
-    result = run_audit(root, doc_filter=doc, severity_filter=severity)
+    # Progress lines go to stderr (text mode only) so long git-backed phases
+    # never look like a hang and JSON stdout stays parseable.
+    progress = (lambda msg: click.echo(f"  … {msg}", err=True)) if fmt == "text" else None
+
+    result = run_audit(root, doc_filter=doc, severity_filter=severity, progress=progress)
     save_audit_cache(root, result)
 
     if fmt == "json":
@@ -59,6 +87,7 @@ def docs_audit(ctx, doc, severity, fix, no_confirm):
                 if f.severity != "pass"
             ],
         }, indent=2))
+        _maybe_strict_exit(result, strict)
         return
 
     # --- text output ---
@@ -112,10 +141,91 @@ def docs_audit(ctx, doc, severity, fix, no_confirm):
             else:
                 click.echo("\nNo fixes applied.")
 
+    _maybe_strict_exit(result, strict)
+
+
+def _maybe_strict_exit(result, strict: bool) -> None:
+    """--strict: non-zero exit ONLY when asked. A merely non-empty audit must
+    never fail scripts by default (the guard-exits-1-on-clean-repos lesson)."""
+    if not strict:
+        return
+    s = result.summary
+    if s.get("warning", 0) or s.get("error", 0):
+        raise ValidationError(
+            "docs audit found issues (--strict)",
+            detail=f"{s.get('error', 0)} error(s), {s.get('warning', 0)} warning(s)",
+        )
+
 
 def _color_ok() -> bool:
     ctx = click.get_current_context(silent=True)
     return ctx is not None
+
+
+@docs_group.command("search")
+@click.argument("query")
+@click.option(
+    "--roots", "roots", multiple=True, type=click.Path(),
+    help="Extra external documentation roots to search (repeatable). "
+         "Persistent roots belong in docs_registry.external_roots in the manifest.",
+)
+@click.option("--limit", default=10, show_default=True, help="Maximum results.")
+@click.option(
+    "--no-refresh", is_flag=True, default=False,
+    help="Skip the derived-index refresh before answering (scripted use).",
+)
+@click.pass_context
+def docs_search(ctx, query, roots, limit, no_refresh):
+    """Search titles, headings, and bodies across the registry corpus.
+
+    \b
+    Examples:
+      grain docs search "bronze routing"
+      grain docs search vault --limit 5 --format json
+      grain docs search vault --roots ~/Diwata/Diwata-Labs/docs
+    """
+    from pathlib import Path as _Path
+
+    repo = ctx.obj.get("repo") if ctx.obj else None
+    fmt = ctx.obj.get("fmt", "text") if ctx.obj else "text"
+    root = resolve_repo_root(repo)
+
+    if not no_refresh:
+        docs_service.refresh_index(root)
+
+    from grain.services.docs_search_service import search_corpus
+
+    extra = [(str(_Path(r).name), _Path(r)) for r in roots]
+    hits = search_corpus(root, query, extra_roots=extra, limit=limit)
+
+    if fmt == "json":
+        click.echo(json.dumps({
+            "query": query,
+            "results": [
+                {
+                    "path": h.rel_path,
+                    "root": h.root_name or "",
+                    "title": h.title,
+                    "score": h.score,
+                    "snippet": h.snippet,
+                }
+                for h in hits
+            ],
+        }, indent=2))
+        return
+
+    if not hits:
+        click.echo(f"grain docs search — no results for '{query}'")
+        return
+
+    click.echo(f"grain docs search — {len(hits)} result(s) for '{query}'")
+    click.echo("")
+    for i, h in enumerate(hits, 1):
+        loc = f"{h.root_name}:{h.rel_path}" if h.root_name else h.rel_path
+        title = f" — {h.title}" if h.title else ""
+        click.echo(f"  {i}. {loc}{title}  (score {h.score})")
+        if h.snippet:
+            click.echo(f"     {h.snippet}")
 
 
 @docs_group.command("validate")
@@ -153,6 +263,104 @@ def docs_index(ctx, dry_run):
 
     if not result.ok:
         raise ValidationError("docs index generation failed")
+
+
+@docs_group.command("verify")
+@click.argument("doc")
+@click.option("--date", "when", default=None, help="Stamp date (YYYY-MM-DD, default today).")
+@click.pass_context
+def docs_verify(ctx, doc, when):
+    """Bump a doc's Last-verified stamp — 'I reread this; it is still true.'
+
+    Verification age is distinct from last-modified: canon staleness means
+    long-UNVERIFIED, not long-unedited. `grain docs audit` nags canonical docs
+    whose stamp (or, unstamped, whose last edit) is older than the manifest's
+    audit_thresholds.canon_unverified_days.
+
+    \b
+    Examples:
+      grain docs verify docs/canonical/architecture.md
+      grain docs verify architecture --date 2026-08-01
+    """
+    from datetime import date as _date
+
+    repo = ctx.obj.get("repo") if ctx.obj else None
+    fmt = ctx.obj.get("fmt", "text") if ctx.obj else "text"
+    root = resolve_repo_root(repo)
+
+    parsed = None
+    if when:
+        try:
+            parsed = _date.fromisoformat(when)
+        except ValueError:
+            raise click.UsageError(f"--date must be YYYY-MM-DD, got {when!r}")
+
+    from grain.services.docs_lifecycle_service import verify_doc
+
+    result = verify_doc(root, doc, when=parsed)
+    print_result(result, fmt=fmt)
+    if not result.ok:
+        raise ValidationError("docs verify failed", detail=result.errors[0] if result.errors else "")
+
+
+@docs_group.command("archive")
+@click.argument("doc")
+@click.pass_context
+def docs_archive(ctx, doc):
+    """Move a doc into docs/archive/, leaving a tombstone at the old path.
+
+    The tombstone (a stub with a forward link) keeps inbound links from
+    rotting — including links from other repos, which no rewrite pass could
+    reach. The manifest entry's path line is updated surgically and the
+    derived index is refreshed.
+
+    \b
+    Examples:
+      grain docs archive docs/working/old_plan.md
+      grain docs archive old_plan
+    """
+    repo = ctx.obj.get("repo") if ctx.obj else None
+    fmt = ctx.obj.get("fmt", "text") if ctx.obj else "text"
+    root = resolve_repo_root(repo)
+
+    from grain.services.docs_lifecycle_service import archive_doc
+
+    result = archive_doc(root, doc)
+    print_result(result, fmt=fmt)
+    if not result.ok:
+        raise ValidationError("docs archive failed", detail=result.errors[0] if result.errors else "")
+
+
+@docs_group.command("promote")
+@click.argument("doc")
+@click.option(
+    "--into", "into", required=True,
+    help="Promotion target: an existing canonical doc (path or id) to supersede, or 'new'.",
+)
+@click.pass_context
+def docs_promote(ctx, doc, into):
+    """Promote a working doc into canonical — resolves a supersession queue item.
+
+    Mechanics only: the command moves files, stamps Last-verified, archives the
+    superseded canon with a supersession note, leaves a tombstone at the old
+    working path, and refreshes the manifest/index. Merging content, when
+    needed, stays human/agent work done BEFORE promoting.
+
+    \b
+    Examples:
+      grain docs promote docs/working/spec_v2.md --into docs/canonical/spec.md
+      grain docs promote docs/working/new_topic.md --into new
+    """
+    repo = ctx.obj.get("repo") if ctx.obj else None
+    fmt = ctx.obj.get("fmt", "text") if ctx.obj else "text"
+    root = resolve_repo_root(repo)
+
+    from grain.services.docs_lifecycle_service import promote_doc
+
+    result = promote_doc(root, doc, into=into)
+    print_result(result, fmt=fmt)
+    if not result.ok:
+        raise ValidationError("docs promote failed", detail=result.errors[0] if result.errors else "")
 
 
 @docs_group.command("show")

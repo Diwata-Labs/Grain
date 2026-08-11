@@ -764,5 +764,15 @@ Key deliverables: `grain workflow guard`, `grain hooks install/list/remove`, `gr
 - **Description:** `grain status` reported `Health: ✗ 1 error(s)` while `run_audit()` on the same tree returned `0 errors` — the cached read outlived the underlying fix. A cache that can disagree with the audit it summarizes is worse than no cache. Invalidate on working-doc mtime, or drop the cache.
 - **Files:** `src/grain/cli/status.py`
 - **Dependencies:** none
+
+### P40-T13 — OIDC Trusted Publishing for grain-contracts + grain-core · TASK-0235
+- **Status:** review
+- **Description:** The grain-contracts 0.2.0 release 403'd at Publish because `PYPI_TOKEN_GRAIN_CONTRACTS`
+  expired. Move grain-contracts + grain-core onto PyPI OIDC Trusted Publishing (no long-lived token):
+  `release-python.yml` gains `id-token: write` and publishes those two with `uv publish
+  --trusted-publishing always`; grain-kit/assay/pulse keep tokens via `--trusted-publishing never`.
+  Operator adds a Trusted Publisher per PyPI project, then the `grain-contracts-v0.2.0` release re-runs.
+- **Files:** `.github/workflows/release-python.yml`
+- **Dependencies:** none
 ---
 - **Carried from:** P36-T17
